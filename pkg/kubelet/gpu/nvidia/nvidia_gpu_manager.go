@@ -22,6 +22,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"strconv"
 	"sync"
 
 	"github.com/golang/glog"
@@ -156,12 +157,40 @@ func (ngm *nvidiaGPUManager) AllocateGPU(pod *v1.Pod, container *v1.Container) (
 	devicesInUse := ngm.allocated.devices()
 	glog.V(5).Infof("gpus in use: %v", devicesInUse.List())
 	// Get a list of available GPUs.
-	available := ngm.allGPUs.Difference(devicesInUse)
-	glog.V(5).Infof("gpus available: %v", available.List())
-	if int64(available.Len()) < gpusNeeded {
-		return nil, fmt.Errorf("requested number of GPUs unavailable. Requested: %d, Available: %d", gpusNeeded, available.Len())
+	available := ngm.allGPUs.Difference(devicesInUse).List()
+	glog.V(5).Infof("gpus available: %v", available)
+	if int64(len(available)) < gpusNeeded {
+		return nil, fmt.Errorf("requested number of GPUs unavailable. Requested: %d, Available: %d", gpusNeeded, len(available))
 	}
-	ret := available.UnsortedList()[:gpusNeeded]
+	var ret []string
+
+	availableIds := make([]int64, len(available))
+	for index, device := range available {
+		deviceID, _ := strconv.ParseInt(device[len("/dev/nvidia"):], 10, 64)
+		availableIds[index] = deviceID
+	}
+	// Try optimizing strategy first
+	var bucketSize = gpusNeeded
+	for bucketSize&-bucketSize != bucketSize { // get the first 2^n larger or equal than gpusNeeded
+		bucketSize += bucketSize & -bucketSize
+	}
+	for i := int64(0); i+gpusNeeded <= int64(len(available)); i++ {
+		firstID := availableIds[i]
+		lastID := availableIds[i+gpusNeeded-1] // last device id in this group
+		continuous := lastID-firstID+1 == gpusNeeded
+		if continuous && lastID&(bucketSize-1) == (bucketSize-1) {
+			ret = make([]string, gpusNeeded)
+			for id := availableIds[i]; id <= lastID; id++ {
+				ret[id-firstID] = fmt.Sprintf("/dev/nvidia%d", id)
+			}
+			break
+		}
+	}
+	// Use legacy strategy
+	if ret == nil {
+		ret = available[:gpusNeeded]
+	}
+
 	for _, device := range ret {
 		// Update internal allocated GPU cache.
 		ngm.allocated.insert(string(pod.UID), device)
